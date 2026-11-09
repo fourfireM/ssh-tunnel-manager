@@ -1,0 +1,27 @@
+name: Windows native tests
+on:
+  push:
+    branches: [windows]
+  pull_request:
+    branches: [windows]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: '1'
+      TD_TEST_TASK_SCHEDULER: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install runtime and SSH test dependencies
+        run: python -m pip install -r requirements.txt "paramiko>=3.5,<5"
+      - name: Check JavaScript syntax
+        run: node --check web/app.js
+      - name: Run unit and native Windows integration tests
+        run: python -m unittest discover -s tests -v

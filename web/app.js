@@ -87,8 +87,8 @@ function card(t) {
   const health = t.health;
   const healthLevel = health ? health.level || (health.ok ? 'good' : 'bad') : '';
   const remoteEntry = route.kind === 'R';
-  const leftHost = remoteEntry ? hostLabel(route) : '这台 Mac';
-  const rightHost = remoteEntry ? (['127.0.0.1','::1','localhost'].includes(route.dest_host) ? '这台 Mac' : route.dest_host) : route.kind === 'D' ? hostLabel(route) : route.dest_host;
+  const leftHost = remoteEntry ? hostLabel(route) : '这台电脑';
+  const rightHost = remoteEntry ? (['127.0.0.1','::1','localhost'].includes(route.dest_host) ? '这台电脑' : route.dest_host) : route.kind === 'D' ? hostLabel(route) : route.dest_host;
   const leftCaption = remoteEntry ? '远端入口' : '本机入口';
   const rightCaption = route.kind === 'D' ? 'SOCKS 出口' : remoteEntry ? '本机可访问的目标' : '远端可访问的目标';
   const rightAddress = route.kind === 'D' ? '经远端访问网络' : `${esc(route.dest_host)}:<strong>${esc(route.dest_port)}</strong>`;
@@ -116,7 +116,7 @@ function render() {
   $('filter-running').textContent = tunnels.filter(running).length;
   $('filter-stopped').textContent = tunnels.filter(t => !running(t)).length;
   $('sync-time').textContent = `最近同步 ${timeLabel(state.updated_at)}`;
-  $('backend-badge-text').textContent = state.backend?.managed_by === 'launchd' ? '后台由 launchd 托管' : '本机安全连接';
+  $('backend-badge-text').textContent = ({launchd:'后台由 launchd 托管',task_scheduler:'后台由任务计划程序托管'}[state.backend?.managed_by] || '本机后台运行中');
   const selected = tunnels.filter(t => (filter === 'all' || (filter === 'running' ? running(t) : !running(t))) && `${t.name} ${t.description} ${t.target} ${hostLabel(t)} ${t.bind_port} ${t.dest_port || ''}`.toLowerCase().includes(query));
   // Avoid replacing an open menu or focused control on every polling tick.
   const fingerprint = JSON.stringify([selected, view, filter, query]);
@@ -172,7 +172,7 @@ function showForm(tunnel = null, clone = false) {
   form.reset();
   editingId = tunnel && !clone ? tunnel.id : null;
   $('form-title').textContent = clone ? '复制通道' : tunnel ? '编辑通道' : '新建通道';
-  const defaults = {name:'',description:'',kind:'R',target:'',ssh_port:'',jump:'',bind_host:'127.0.0.1',bind_port:'',dest_host:'127.0.0.1',dest_port:'',auth_mode:'auto',auto_reconnect:false,health_type:'http_proxy',health_url:'https://www.baidu.com',identity_file:'',config_file:''};
+  const defaults = {name:'',description:'',kind:'R',target:'',ssh_port:'',jump:'',bind_host:'127.0.0.1',bind_port:'',dest_host:'127.0.0.1',dest_port:'',auth_mode:'key',auto_reconnect:false,health_type:'http_proxy',health_url:'https://www.baidu.com',identity_file:'',config_file:''};
   const data = {...defaults, ...(tunnel || {})};
   if (clone) { data.name += ' · 副本'; data.bind_port = ''; data.auto_reconnect = false; }
   for (const key of Object.keys(defaults)) {
@@ -183,7 +183,7 @@ function showForm(tunnel = null, clone = false) {
   const launchd = tunnel?.source === 'launchd' && !clone;
   form.elements.namedItem('auth_mode').disabled = launchd;
   form.elements.namedItem('auto_reconnect').disabled = launchd;
-  $('reconnect-help').textContent = launchd ? '此连接由系统任务负责保活；关闭开关会停用系统任务。' : '自动恢复只尝试密钥认证；需要密码时请手动开启。';
+  $('reconnect-help').textContent = launchd ? '此连接由系统任务负责保活；关闭开关会停用系统任务。' : '自动恢复使用 SSH 密钥 / ssh-agent；请先在 PowerShell 验证免交互登录。';
   $('source-notice').hidden = !launchd;
   $('source-notice').textContent = '已有系统任务将被保留。修改线路后，只有在你开启或重启时才应用；原任务会自动备份。';
   $('save-hint').textContent = tunnel && running(tunnel) && !clone ? '保存不会中断当前连接，修改在重启后生效。' : '保存配置后，手动开启连接。';
@@ -196,8 +196,8 @@ function updateForm() {
   const form = $('profile-form'), kind = form.elements.namedItem('kind').value;
   document.querySelectorAll('.destination-field').forEach(el => { el.hidden = kind === 'D'; });
   form.elements.namedItem('dest_port').required = kind !== 'D';
-  $('bind-port-label').textContent = kind === 'R' ? '远端监听端口' : 'Mac 监听端口';
-  $('destination-help').textContent = kind === 'R' ? '由 Mac 连接这个目标地址' : '由远端服务器连接这个目标地址';
+  $('bind-port-label').textContent = kind === 'R' ? '远端监听端口' : '本机 监听端口';
+  $('destination-help').textContent = kind === 'R' ? '由 本机 连接这个目标地址' : '由远端服务器连接这个目标地址';
   $('health-url-field').hidden = form.elements.namedItem('health_type').value === 'tcp';
 }
 
@@ -239,8 +239,8 @@ async function operate(id, action) {
   try {
     const job = await api(`/api/tunnels/${id}/${action}`, {method:'POST',body:{}});
     watchedJobs.add(job.id);
-    if (action === 'start' || action === 'restart') toast('正在建立连接；需要密码时会出现 Mac 系统窗口。');
-    if (action === 'check') toast('正在检测实际链路；已有连接可能需要再次认证。');
+    if (action === 'start' || action === 'restart') toast('正在使用 SSH 密钥 / ssh-agent 建立连接。');
+    if (action === 'check') toast('正在使用 SSH 密钥检测实际链路。');
     await refresh();
   } catch (error) { toast(error.message, true); }
 }

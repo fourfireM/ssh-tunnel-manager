@@ -136,9 +136,14 @@ class LifecycleTests(unittest.TestCase):
         self.assertNotIn("BatchMode=no", command)
         with patch.object(app.subprocess, "run", return_value=app.subprocess.CompletedProcess([], 0, "", "")):
             env = self.manager._ssh_env(allow_prompt=False)
-        self.assertEqual(env["SSH_ASKPASS"], str(self.manager.deny_askpass_path))
-        self.assertNotEqual(env["SSH_ASKPASS"], str(self.manager.askpass_path))
+        if app.WINDOWS:
+            self.assertEqual(env["SSH_ASKPASS_REQUIRE"], "never")
+            self.assertNotIn("SSH_ASKPASS", env)
+        else:
+            self.assertEqual(env["SSH_ASKPASS"], str(self.manager.deny_askpass_path))
+            self.assertNotEqual(env["SSH_ASKPASS"], str(self.manager.askpass_path))
 
+    @unittest.skipIf(app.WINDOWS, "launchd is a macOS integration")
     def test_keepalive_launchd_stop_disables_and_unloads_instead_of_kill(self):
         self.p.update(source="launchd", launch_label="test.ssh", launch_path="/unused")
         self.manager.profiles = [self.p]
@@ -170,7 +175,8 @@ class LifecycleTests(unittest.TestCase):
         after = app.access_token(Path(self.tmp.name))
         self.assertEqual(before, after)
         self.assertGreaterEqual(len(before), 40)
-        self.assertEqual((Path(self.tmp.name)/'access-token.json').stat().st_mode & 0o777, 0o600)
+        if not app.WINDOWS:
+            self.assertEqual((Path(self.tmp.name)/'access-token.json').stat().st_mode & 0o777, 0o600)
 
     def test_pending_configuration_cannot_probe_the_wrong_endpoint(self):
         live = copy.deepcopy(self.p)
@@ -247,7 +253,8 @@ class HealthCheckTests(unittest.TestCase):
             # HTTP fixture, without needing an SSH server in the unit suite.
             if command[0] == "/test/ssh":
                 command = shlex.split(command[-1])
-                command[0] = "/usr/bin/curl"
+                command[0] = app.CURL
+                command = [app.os.devnull if arg == "/dev/null" else arg for arg in command]
             return real_run(command, **kwargs)
 
         with patch.object(self.manager, "_refresh"), patch.object(self.manager, "_current_process", return_value={"pid": 1234}), patch.object(self.manager, "_connection_args", return_value=["/test/ssh"]), patch.object(self.manager, "_ssh_env", return_value=None), patch.object(app.subprocess, "run", side_effect=execute_probe):

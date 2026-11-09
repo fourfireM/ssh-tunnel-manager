@@ -28,10 +28,14 @@ from urllib.request import Request, build_opener, ProxyHandler
 import uuid
 import webbrowser
 
+import windows_support as win
+
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_STATE = ROOT / ".state"
-SSH = "/usr/bin/ssh"
+WINDOWS = sys.platform == "win32"
+DEFAULT_STATE = win.default_state_dir() if WINDOWS else ROOT / ".state"
+SSH = win.executable("ssh") if WINDOWS else "/usr/bin/ssh"
+CURL = win.executable("curl") if WINDOWS else "/usr/bin/curl"
 LAUNCHCTL = "/bin/launchctl"
 SERVICE_LABEL = "local.tunneldesk.manager"
 LOOPBACK = {"127.0.0.1", "::1", "localhost"}
@@ -42,6 +46,42 @@ PROFILE_FIELDS = {
     "bind_port", "dest_host", "dest_port", "auth_mode", "auto_reconnect",
     "health_type", "health_url", "identity_file", "config_file",
 }
+
+
+def run_process(*args, **kwargs):
+    if WINDOWS:
+        kwargs.setdefault("creationflags", subprocess.CREATE_NO_WINDOW)
+        if kwargs.get("text") or kwargs.get("universal_newlines"):
+            kwargs.setdefault("encoding", "utf-8")
+            kwargs.setdefault("errors", "replace")
+    return subprocess.run(*args, **kwargs)
+
+
+def process_options():
+    return win.detached_options() if WINDOWS else {"start_new_session": True}
+
+
+def private_directory(path):
+    path = Path(path)
+    if path.is_symlink():
+        raise UserError("状态目录不能是符号链接")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if WINDOWS:
+        win.secure_state_directory(path)
+    else:
+        os.chmod(path, 0o700)
+
+
+def backend_kind():
+    if WINDOWS and os.environ.get("TUNNEL_DESK_TASK") == "1":
+        return "task_scheduler"
+    return "launchd" if os.environ.get("TUNNEL_DESK_LAUNCHD") == "1" else "process"
+
+
+def display_command(args):
+    if WINDOWS:
+        return "& " + " ".join("'" + value.replace("'", "''") + "'" for value in args)
+    return shlex.join(args)
 
 
 def stamp():
@@ -134,7 +174,7 @@ def validate_profile(data, original=None):
     result["auth_mode"] = result.get("auth_mode", "auto")
     if result["auth_mode"] not in {"auto", "key"}:
         raise UserError("认证方式不正确")
-    if result.get("source") == "launchd":
+    if WINDOWS or result.get("source") == "launchd":
         result["auth_mode"] = "key"
     if not isinstance(result.get("auto_reconnect", False), bool):
         raise UserError("自动重连设置必须为布尔值")
@@ -180,7 +220,7 @@ def split_forward(text, kind):
 
 def parse_ssh(argv):
     """Discover explicit TCP forwards; never treat a ProxyJump helper as a tunnel."""
-    if not argv or Path(argv[0]).name != "ssh":
+    if not argv or Path(argv[0].replace("\\", "/")).name.lower() not in {"ssh", "ssh.exe"}:
         return []
     options, forwards, target = {}, [], ""
     value_options = set("BbcDEeFIiJLlmOopQRSWw")
@@ -247,10 +287,10 @@ def connection_settings(p):
         "dest_port", "identity_file", "config_file", "auth_mode"))
 
 
-def http_probe_args(profile, endpoint, executable="curl"):
+def http_probe_args(profile, endpoint, executable="curl", null_device="/dev/null"):
     # Many APIs register GET routes without supporting HEAD. Discard response
     # bodies so model lists and other API data never enter the diagnostic log.
-    args = [executable, "-sS", "--dump-header", "-", "--output", "/dev/null",
+    args = [executable, "-sS", "--dump-header", "-", "--output", null_device,
             "--connect-timeout", "5", "--max-time", "15", "--noproxy", ""]
     if profile["health_type"] in {"http_proxy", "socks5"} or profile["kind"] == "D":
         scheme = "socks5h" if profile["kind"] == "D" or profile["health_type"] == "socks5" else "http"
@@ -261,8 +301,17 @@ def http_probe_args(profile, endpoint, executable="curl"):
 
 
 def scan_processes():
+    if WINDOWS:
+        try:
+            found = []
+            for record in win.ssh_processes():
+                for profile in parse_ssh(record["argv"]):
+                    found.append({**record, "profile": profile})
+            return found, ""
+        except (OSError, RuntimeError) as exc:
+            return [], "无法读取 Windows SSH 进程：" + str(exc)
     try:
-        result = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,args="],
+        result = run_process(["/bin/ps", "-axo", "pid=,ppid=,args="],
                                 capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return [], "无法读取 SSH 进程：" + str(exc)
@@ -287,8 +336,10 @@ def scan_processes():
 
 
 def process_identity(pid):
+    if WINDOWS:
+        return win.process_identity(pid)
     try:
-        out = subprocess.run(["/bin/ps", "-p", str(int(pid)), "-o", "lstart=,args="],
+        out = run_process(["/bin/ps", "-p", str(int(pid)), "-o", "lstart=,args="],
                              capture_output=True, text=True, timeout=3)
         return hashlib.sha256(out.stdout.strip().encode()).hexdigest() if out.returncode == 0 and out.stdout.strip() else ""
     except (ValueError, OSError, subprocess.TimeoutExpired):
@@ -298,6 +349,9 @@ def process_identity(pid):
 def safe_signal(pid, expected_identity):
     if not expected_identity or process_identity(pid) != expected_identity:
         raise UserError("进程已发生变化，已取消停止操作。请刷新状态后重试。")
+    if WINDOWS:
+        win.terminate_ssh(pid, expected_identity)
+        return
     try:
         os.kill(int(pid), signal.SIGTERM)
     except ProcessLookupError:
@@ -305,6 +359,8 @@ def safe_signal(pid, expected_identity):
 
 
 def read_launch_agents():
+    if WINDOWS:
+        return []
     found = []
     for path in (Path.home() / "Library/LaunchAgents").glob("*.plist"):
         try:
@@ -360,8 +416,7 @@ def ssh_aliases():
 class Manager:
     def __init__(self, state_dir=DEFAULT_STATE, discover=True, monitor=True):
         self.state_dir = Path(state_dir)
-        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.state_dir, 0o700)
+        private_directory(self.state_dir)
         self.log_dir = self.state_dir / "logs"
         self.log_dir.mkdir(mode=0o700, exist_ok=True)
         self.control_dir = self.state_dir / "sockets"
@@ -389,6 +444,8 @@ class Manager:
             threading.Thread(target=self._monitor, name="tunnel-monitor", daemon=True).start()
 
     def _write_askpass(self):
+        if WINDOWS:
+            return
         self.askpass_path = self.state_dir / "askpass"
         text = "#!/bin/sh\nexec " + shlex.join([sys.executable, str(ROOT / "askpass.py")]) + ' "$@"\n'
         self.askpass_path.write_text(text)
@@ -430,7 +487,7 @@ class Manager:
             args += ["-p", str(profile["ssh_port"])]
         args += [profile["target"]]
         try:
-            out = subprocess.run(args, capture_output=True, text=True, timeout=4)
+            out = run_process(args, capture_output=True, text=True, timeout=4)
             if not out.returncode:
                 for line in out.stdout.splitlines():
                     fields = line.split(None, 1)
@@ -443,10 +500,10 @@ class Manager:
 
     def _default_labels(self, profile):
         if profile["kind"] == "R" and profile["dest_port"] == 7897:
-            profile.update(name="训练机 · 网络代理", description="经跳板机使用 Mac 的网络代理，供下载与联网工具使用",
+            profile.update(name=profile["target"].split("@")[-1] + " · 网络代理", description="通过本机网络代理下载或访问外网",
                            health_type="http_proxy", health_url="https://www.baidu.com")
         elif profile["kind"] == "R" and profile["dest_port"] == 8317:
-            profile.update(name="p6000 · 模型接口", description="将 Mac 上的 CLIProxyAPI 接口提供给 p6000",
+            profile.update(name=profile["target"].split("@")[-1] + " · 模型接口", description="将本机模型接口提供给远端服务器",
                            health_type="http", health_url=f"http://127.0.0.1:{profile['bind_port']}/v1/models")
         return profile
 
@@ -568,7 +625,7 @@ class Manager:
                             pending_changes=bool(current and connection_settings(profile) != connection_settings(rt.get("observed_profile", profile))),
                             connected_at=rt.get("connected_at"), last_error=rt.get("last_error", ""),
                             health=rt.get("health") if current else None,
-                            command=shlex.join(self.build_ssh(profile)),
+                            command=display_command(self.build_ssh(profile)),
                             busy=any(j["tunnel_id"] == profile["id"] and j["status"] == "running" for j in self.jobs.values()),
                             retry_at=rt.get("retry_at"))
                 cards.append(card)
@@ -576,9 +633,9 @@ class Manager:
             return {"tunnels": cards, "aliases": self.aliases, "scan_error": self.scan_error,
                     "events": self.events[:12], "jobs": list(self.jobs.values())[-30:],
                     "updated_at": stamp(), "platform": sys.platform,
-                    "backend": {"managed_by": "launchd" if os.environ.get("TUNNEL_DESK_LAUNCHD") == "1" else "process",
+                    "backend": {"managed_by": backend_kind(),
                                 "pid": os.getpid(), "service_label": SERVICE_LABEL},
-                    "security": {"bind": "127.0.0.1", "credentials": "macOS 系统弹窗 / ssh-agent"}}
+                    "security": {"bind": "127.0.0.1", "credentials": "SSH 密钥 / ssh-agent" if WINDOWS else "macOS 系统弹窗 / ssh-agent"}}
 
     def _check_conflict(self, profile):
         for other in self.profiles:
@@ -644,7 +701,7 @@ class Manager:
         args += ["-o", "BatchMode=" + ("no" if interactive and profile["auth_mode"] == "auto" else "yes"),
                  "-o", "StrictHostKeyChecking=yes", "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
                  "-o", "ConnectTimeout=12", "-o", "ConnectionAttempts=1", "-o", "NumberOfPasswordPrompts=1"]
-        if control and self.control_path(profile).exists():
+        if not WINDOWS and control and self.control_path(profile).exists():
             args += ["-S", str(self.control_path(profile)), "-o", "ControlMaster=no"]
         return args
 
@@ -656,7 +713,9 @@ class Manager:
         args = self._connection_args(profile, interactive, control=False)
         args += ["-NT", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30",
                  "-o", "ServerAliveCountMax=3"]
-        if profile.get("source") == "launchd":
+        if WINDOWS:
+            pass  # Windows OpenSSH does not support Unix ControlMaster sockets.
+        elif profile.get("source") == "launchd":
             args += ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
         else:
             args += ["-M", "-S", str(self.control_path(profile)), "-o", "ControlPersist=no"]
@@ -668,13 +727,17 @@ class Manager:
 
     def _ssh_env(self, allow_prompt=True):
         env = os.environ.copy()
+        if WINDOWS:
+            env.pop("SSH_ASKPASS", None)
+            env["SSH_ASKPASS_REQUIRE"] = "never"
+            return env
         # BatchMode on the target does not propagate to ProxyJump helpers.
         # Enforce no prompts in the inherited environment as well.
         env.update(SSH_ASKPASS=str(self.askpass_path if allow_prompt else self.deny_askpass_path), SSH_ASKPASS_REQUIRE="force")
         env.setdefault("DISPLAY", ":0")
         if not env.get("SSH_AUTH_SOCK"):
             try:
-                result = subprocess.run([LAUNCHCTL, "getenv", "SSH_AUTH_SOCK"],
+                result = run_process([LAUNCHCTL, "getenv", "SSH_AUTH_SOCK"],
                                         capture_output=True, text=True, timeout=2)
                 candidate = result.stdout.strip()
                 if candidate and Path(candidate).exists():
@@ -725,7 +788,7 @@ class Manager:
         return path, obj
 
     def _launchctl(self, *args, check=True):
-        result = subprocess.run([LAUNCHCTL, *args], capture_output=True, text=True, timeout=15)
+        result = run_process([LAUNCHCTL, *args], capture_output=True, text=True, timeout=15)
         if check and result.returncode:
             raise UserError("系统任务操作失败：" + (result.stderr or result.stdout).strip()[-600:])
         return result
@@ -787,12 +850,12 @@ class Manager:
             self.control_path(profile).unlink(missing_ok=True)
             args = self.build_ssh(profile, interactive=interactive)
             path = self._log_path(profile_id)
-            self._append_log(profile_id, "启动 SSH；" + ("自动恢复仅使用密钥，不弹出密码窗口" if automatic else "如需密码，将使用 macOS 系统弹窗"))
+            self._append_log(profile_id, "启动 SSH；" + ("使用 SSH 密钥 / ssh-agent 认证" if WINDOWS else "自动恢复仅使用密钥，不弹出密码窗口" if automatic else "如需密码，将使用 macOS 系统弹窗"))
             # Keep diagnostics in a private file. Never send credentials through HTTP.
             args[1:1] = ["-v", "-E", str(path)]
             with path.open("ab", buffering=0) as log_stream:
                 child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                         stderr=log_stream, start_new_session=True,
+                                         stderr=log_stream, **process_options(),
                                          env=self._ssh_env(allow_prompt=interactive and profile["auth_mode"] == "auto"))
             with self.lock:
                 self.children[child.pid] = child
@@ -809,7 +872,7 @@ class Manager:
         self._refresh()
         with self.lock:
             self._save()
-        return "连接已启动；若出现系统认证窗口，请在窗口中完成登录"
+        return "连接已启动，正在使用 SSH 密钥 / ssh-agent 认证" if WINDOWS else "连接已启动；若出现系统认证窗口，请在窗口中完成登录"
 
     @staticmethod
     def _friendly_error(log):
@@ -881,8 +944,8 @@ class Manager:
             command = self._connection_args(profile, interactive=True)
             command += [profile["target"], remote]
             try:
-                result = subprocess.run(command, capture_output=True, text=True, timeout=145,
-                                        stdin=subprocess.DEVNULL, start_new_session=True,
+                result = run_process(command, capture_output=True, text=True, timeout=145,
+                                        stdin=subprocess.DEVNULL, **process_options(),
                                         env=self._ssh_env(allow_prompt=profile["auth_mode"] == "auto"))
             except subprocess.TimeoutExpired:
                 raise UserError("检测超时；请检查认证窗口、远端 curl/python3 和网络")
@@ -896,8 +959,8 @@ class Manager:
                 except OSError as exc:
                     result = subprocess.CompletedProcess([], 1, "", str(exc))
             else:
-                command = http_probe_args(profile, endpoint, executable="/usr/bin/curl")
-                result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+                command = http_probe_args(profile, endpoint, executable=CURL, null_device=os.devnull)
+                result = run_process(command, capture_output=True, text=True, timeout=20)
         output = (result.stdout + "\n" + result.stderr).strip()[-7000:]
         status_matches = re.findall(r"__TD_STATUS__:(\d{3})", output)
         http_status = int(status_matches[-1]) if status_matches else None
@@ -1207,6 +1270,22 @@ def open_page(info):
     webbrowser.open(f"http://127.0.0.1:{info['port']}/#token={info['token']}")
 
 
+def shutdown_backend(state_dir):
+    info = existing_server(state_dir)
+    if not info:
+        return
+    opener = build_opener(ProxyHandler({}))
+    request = Request(f"http://127.0.0.1:{info['port']}/api/shutdown", data=b"{}", method="POST",
+                      headers={"Authorization": "Bearer " + info["token"], "Content-Type": "application/json"})
+    with opener.open(request, timeout=5):
+        pass
+    for _ in range(50):
+        if not existing_server(state_dir):
+            return
+        time.sleep(.1)
+    raise UserError("后台尚未退出，请稍后重试")
+
+
 def service_plist(state_dir, port_number):
     return {
         "Label": SERVICE_LABEL,
@@ -1227,6 +1306,18 @@ def service_plist(state_dir, port_number):
 
 def install_service(state_dir, port_number):
     """Install only the current user's manager job; never alter tunnel jobs."""
+    if WINDOWS:
+        private_directory(state_dir)
+        info = existing_server(state_dir)
+        if info and info.get("managed_by") != "task_scheduler":
+            shutdown_backend(state_dir)
+        win.install_task(ROOT, state_dir, port_number)
+        for _ in range(100):
+            info = existing_server(state_dir)
+            if info and info.get("managed_by") == "task_scheduler":
+                return info
+            time.sleep(.2)
+        raise UserError("计划任务已注册，但后台未就绪。请查看状态目录的 server.log 和任务计划程序历史记录")
     if sys.platform != "darwin":
         raise UserError("launchd 托管仅适用于 macOS")
     state_dir = Path(state_dir).resolve()
@@ -1251,7 +1342,7 @@ def install_service(state_dir, port_number):
             fd = os.open(backup / ("manager-" + str(time.time_ns()) + ".plist"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream:
                 stream.write(path.read_bytes())
-    loaded = subprocess.run([LAUNCHCTL, "print", job], capture_output=True).returncode == 0
+    loaded = run_process([LAUNCHCTL, "print", job], capture_output=True).returncode == 0
     running_info = existing_server(state_dir)
     if running_info and running_info.get("managed_by") == "process":
         # Migrate an earlier manually started manager, leaving its SSH children alive.
@@ -1265,7 +1356,7 @@ def install_service(state_dir, port_number):
                 break
             time.sleep(.1)
     if changed and loaded:
-        result = subprocess.run([LAUNCHCTL, "bootout", job], capture_output=True, text=True)
+        result = run_process([LAUNCHCTL, "bootout", job], capture_output=True, text=True)
         if result.returncode:
             raise UserError("无法重新加载管理后台：" + result.stderr.strip())
         loaded = False
@@ -1280,11 +1371,11 @@ def install_service(state_dir, port_number):
             temp.unlink(missing_ok=True)
     log_fd = os.open(state_dir / "server.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     os.close(log_fd)
-    result = subprocess.run([LAUNCHCTL, "enable", job], capture_output=True, text=True)
+    result = run_process([LAUNCHCTL, "enable", job], capture_output=True, text=True)
     if result.returncode:
         raise UserError("无法启用管理后台：" + result.stderr.strip())
     command = [LAUNCHCTL, "kickstart", job] if loaded else [LAUNCHCTL, "bootstrap", domain, str(path)]
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = run_process(command, capture_output=True, text=True)
     if result.returncode:
         raise UserError("无法启动管理后台：" + result.stderr.strip())
     for _ in range(100):
@@ -1299,10 +1390,36 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Tunnel Desk · 本机 SSH 隧道管理")
     parser.add_argument("--open", action="store_true", help="在默认浏览器中打开")
     parser.add_argument("--background", action="store_true", help="后台启动管理页面")
-    parser.add_argument("--install-service", action="store_true", help="安装或启动当前用户的 launchd 后台")
+    parser.add_argument("--install-service", action="store_true", help="安装登录自启动：Windows 任务计划程序 / macOS launchd")
+    parser.add_argument("--uninstall-service", action="store_true", help="Windows：停用并删除本应用的登录自启动任务")
+    parser.add_argument("--service-status", action="store_true", help="Windows：查看登录自启动任务状态")
+    parser.add_argument("--stop-backend", action="store_true", help="停止本机网页后台")
+    parser.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--port", type=int, default=17899)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
     args = parser.parse_args(argv)
+    if WINDOWS:
+        win.check_requirements()
+        private_directory(args.state_dir)
+    if args.scheduled:
+        if not WINDOWS:
+            parser.error("--scheduled 仅用于 Windows 计划任务")
+        os.environ["TUNNEL_DESK_TASK"] = "1"
+        log = open(args.state_dir / "server.log", "a", encoding="utf-8", buffering=1)
+        sys.stdout = sys.stderr = log
+    if args.uninstall_service or args.service_status:
+        if not WINDOWS:
+            parser.error("此操作仅适用于 Windows 任务计划程序")
+        if args.uninstall_service:
+            win.uninstall_task(args.state_dir)
+            print("登录自启动任务已移除；任务停止可能同时关闭其创建的 SSH 连接")
+        else:
+            print(win.task_status(args.state_dir))
+        return 0
+    if args.stop_backend:
+        shutdown_backend(args.state_dir)
+        print("网页后台已停止；使用任务计划托管时，请用 --uninstall-service 停用登录自启动")
+        return 0
     if not 1024 <= args.port <= 65535:
         parser.error("端口必须在 1024–65535 之间")
     if args.install_service:
@@ -1310,7 +1427,7 @@ def main(argv=None):
             info = install_service(args.state_dir, args.port)
             if args.open:
                 open_page(info)
-            print(f"launchd 后台已就绪：http://127.0.0.1:{info['port']}")
+            print(f"登录自启动后台已就绪：http://127.0.0.1:{info['port']}")
             return 0
         except (UserError, OSError) as exc:
             print(str(exc), file=sys.stderr)
@@ -1321,14 +1438,13 @@ def main(argv=None):
             open_page(info)
         print(f"管理器已运行：http://127.0.0.1:{info['port']}")
         return 0
-    args.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(args.state_dir, 0o700)
+    private_directory(args.state_dir)
     if args.background:
         log_path = args.state_dir / "server.log"
         fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "ab") as log:
             child = subprocess.Popen([sys.executable, str(ROOT / "main.py"), "--port", str(args.port), "--state-dir", str(args.state_dir)],
-                                     stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+                                     stdin=subprocess.DEVNULL, stdout=log, stderr=log, **process_options())
         for _ in range(80):
             time.sleep(.15)
             info = existing_server(args.state_dir)
@@ -1355,7 +1471,7 @@ def main(argv=None):
         print("没有可用的本机端口", file=sys.stderr)
         return 1
     info = {"pid": os.getpid(), "port": server.server_address[1], "token": token, "started_at": stamp(),
-            "managed_by": "launchd" if os.environ.get("TUNNEL_DESK_LAUNCHD") == "1" else "process"}
+            "managed_by": backend_kind()}
     atomic_json(args.state_dir / "server.json", info)
     print(f"Tunnel Desk：http://127.0.0.1:{info['port']}（仅本机访问）", flush=True)
     if args.open:
@@ -1374,4 +1490,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (UserError, OSError, RuntimeError) as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
