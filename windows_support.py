@@ -41,9 +41,13 @@ def detached_options():
 
 
 def powershell(script, variables=None, timeout=30):
-    preamble = "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); "
-    encoded = base64.b64encode((preamble + script).encode("utf-16-le")).decode("ascii")
+    preamble = "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); "
+    program = preamble + "try {\n" + script + "\nexit 0\n} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"
+    encoded = base64.b64encode(program.encode("utf-16-le")).decode("ascii")
     env = os.environ.copy()
+    # PowerShell 7 injects its own module paths; Windows PowerShell 5.1 cannot
+    # load those versions of Microsoft.PowerShell.Security. Use only its system modules.
+    env["PSModulePath"] = str(Path(executable("powershell")).parent / "Modules")
     env.update({key: str(value) for key, value in (variables or {}).items()})
     result = subprocess.run([executable("powershell"), "-NoLogo", "-NoProfile", "-NonInteractive",
                              "-EncodedCommand", encoded], env=env, capture_output=True,

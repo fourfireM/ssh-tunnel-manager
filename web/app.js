@@ -196,8 +196,8 @@ function updateForm() {
   const form = $('profile-form'), kind = form.elements.namedItem('kind').value;
   document.querySelectorAll('.destination-field').forEach(el => { el.hidden = kind === 'D'; });
   form.elements.namedItem('dest_port').required = kind !== 'D';
-  $('bind-port-label').textContent = kind === 'R' ? '远端监听端口' : '本机 监听端口';
-  $('destination-help').textContent = kind === 'R' ? '由 本机 连接这个目标地址' : '由远端服务器连接这个目标地址';
+  $('bind-port-label').textContent = kind === 'R' ? '远端监听端口' : '本机监听端口';
+  $('destination-help').textContent = kind === 'R' ? '由本机连接这个目标地址' : '由远端服务器连接这个目标地址';
   $('health-url-field').hidden = form.elements.namedItem('health_type').value === 'tcp';
 }
 

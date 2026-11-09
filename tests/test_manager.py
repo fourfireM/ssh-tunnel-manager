@@ -72,7 +72,7 @@ class DiscoveryTests(unittest.TestCase):
     def test_discovery_does_not_restart_existing_connections(self):
         existing = app.validate_profile(profile())
         processes = [{"pid": 1234, "ppid": 1, "command": "ssh", "profile": existing}]
-        with tempfile.TemporaryDirectory() as directory, patch.object(app, "scan_processes", return_value=(processes, "")), patch.object(app, "read_launch_agents", return_value=[]), patch.object(app, "process_identity", return_value="identity"), patch.object(app.subprocess, "Popen") as popen, patch.object(app, "safe_signal") as stop:
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "scan_processes", return_value=(processes, "")), patch.object(app, "read_launch_agents", return_value=[]), patch.object(app, "process_identity", return_value="identity"), patch.object(app.subprocess, "Popen") as popen, patch.object(app, "safe_signal") as stop, patch.object(app.win, "secure_state_directory"):
             manager = app.Manager(directory, discover=False, monitor=False)
             self.assertEqual(manager.discover(), 1)
             self.assertEqual(manager.discover(), 0)
@@ -108,7 +108,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_scan_failure_never_starts_or_stops_a_tunnel(self):
         self.manager.scan_error = "denied"
-        with patch.object(self.manager, "_refresh"), patch.object(app.subprocess, "Popen") as popen, patch.object(app, "safe_signal") as stop:
+        with patch.object(self.manager, "_refresh"), patch.object(app.subprocess, "Popen") as popen, patch.object(app, "safe_signal") as stop, patch.object(app.win, "secure_state_directory"):
             with self.assertRaises(app.UserError):
                 self.manager.start(self.p["id"])
             with self.assertRaises(app.UserError):
