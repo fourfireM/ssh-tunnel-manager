@@ -852,11 +852,26 @@ class Manager:
             path = self._log_path(profile_id)
             self._append_log(profile_id, "启动 SSH；" + ("使用 SSH 密钥 / ssh-agent 认证" if WINDOWS else "自动恢复仅使用密钥，不弹出密码窗口" if automatic else "如需密码，将使用 macOS 系统弹窗"))
             # Keep diagnostics in a private file. Never send credentials through HTTP.
-            args[1:1] = ["-v", "-E", str(path)]
-            with path.open("ab", buffering=0) as log_stream:
+            if WINDOWS:
+                # Windows OpenSSH opens -E logs with exclusive sharing, making
+                # the live authentication log unreadable. Capture stderr instead.
+                args[1:1] = ["-v"]
                 child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                         stderr=log_stream, **process_options(),
-                                         env=self._ssh_env(allow_prompt=interactive and profile["auth_mode"] == "auto"))
+                                         stderr=subprocess.PIPE, **process_options(), env=self._ssh_env())
+                def capture_log():
+                    try:
+                        for line in iter(child.stderr.readline, b""):
+                            with path.open("ab") as stream:
+                                stream.write(line)
+                    finally:
+                        child.stderr.close()
+                threading.Thread(target=capture_log, daemon=True, name="ssh-log").start()
+            else:
+                args[1:1] = ["-v", "-E", str(path)]
+                with path.open("ab", buffering=0) as log_stream:
+                    child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                             stderr=log_stream, **process_options(),
+                                             env=self._ssh_env(allow_prompt=interactive and profile["auth_mode"] == "auto"))
             with self.lock:
                 self.children[child.pid] = child
                 rt.update(pid=child.pid, identity=process_identity(child.pid), owned=True, authenticated=False,

@@ -139,7 +139,7 @@ class NativeOpenSSHTests(unittest.TestCase):
                         except OSError:
                             return
                         try:
-                            channel = transport.open_forwarded_tcpip_channel((address, port), origin)
+                            channel = transport.open_forwarded_tcpip_channel(origin, (address, port))
                             threading.Thread(target=bridge, args=(peer, channel), daemon=True).start()
                         except (OSError, paramiko.SSHException):
                             peer.close()
