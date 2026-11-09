@@ -259,4 +259,6 @@ py -3 -m unittest discover -s tests -v
 
 Windows 原生 CI 会验证进程管理、文件 ACL、HTTP 检测，并用临时 SSH 服务测试 OpenSSH 的 L/R/D 转发；另有计划任务注册、启动、卸载检查。CI 仅使用临时测试密钥和临时服务器，不访问真实训练机。各次结果见仓库 Actions 页面。
 
-CI 通过表示测试环境内验证通过；Windows 10/11 实际桌面的休眠恢复、企业安全策略及各类第三方代理客户端仍需在真实环境验证。网页密码认证暂不支持。
+已验证记录：提交 `86f04a1` 在 **GitHub 托管的 Windows Server 2025 / Python 3.12** 上运行 41 项测试，**40 项通过、1 项 macOS 专用测试跳过**。其中真实 OpenSSH 的 L/R/D 转发、进程发现与关闭、后台启停、ACL 和计划任务注册/启动/卸载均通过：[查看测试记录](https://github.com/fourfireM/ssh-tunnel-manager/actions/runs/42583400126)。
+
+这不是在用户自己的 Windows 10/11 电脑上部署验收。Windows 10/11 实际桌面的休眠恢复、企业安全策略及各类第三方代理客户端仍需在真实环境验证。网页密码认证暂不支持。
