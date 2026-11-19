@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tunnel Desk: a loopback-only SSH tunnel manager using the Python standard library."""
+"""Tunnel Desk: a local SSH tunnel manager using the Python standard library."""
 from __future__ import annotations
 
 import argparse
@@ -40,7 +40,7 @@ HOST_RE = re.compile(r"^[\w.:[\]-]+$", re.UNICODE)
 PROFILE_FIELDS = {
     "name", "description", "kind", "target", "ssh_port", "jump", "bind_host",
     "bind_port", "dest_host", "dest_port", "auth_mode", "auto_reconnect",
-    "health_type", "health_url", "identity_file", "config_file",
+    "health_type", "health_url", "identity_file", "config_file", "access_scope", "network_interface",
 }
 
 
@@ -70,6 +70,68 @@ def read_json(path, default):
 
 class UserError(Exception):
     pass
+
+
+def parse_network_interfaces(ifconfig, hardware="", default_interface=""):
+    labels = dict((device, label) for label, device in re.findall(
+        r"Hardware Port: ([^\n]+)\nDevice: (\S+)", hardware))
+    found = []
+    for block in re.split(r"(?=^\w[^\n]*: flags=)", ifconfig, flags=re.M):
+        header = re.match(r"([\w.-]+): flags=\d+<([^>]+)>", block)
+        if not header or "UP" not in header[2].split(",") or "status: inactive" in block:
+            continue
+        name = header[1]
+        physical = name in labels or bool(re.fullmatch(r"en\d+", name))
+        for address in re.findall(r"^\s+inet (\d+\.\d+\.\d+\.\d+)\b", block, re.M):
+            ip = ipaddress.IPv4Address(address)
+            if ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_link_local:
+                continue
+            found.append({"interface": name, "address": address,
+                          "label": labels.get(name, name), "physical": physical,
+                          "recommended": False})
+    found.sort(key=lambda item: (not item["physical"], item["interface"] != default_interface,
+                                 item["interface"], item["address"]))
+    if found and found[0]["physical"]:
+        found[0]["recommended"] = True
+    return found
+
+
+_network_cache = {"time": 0, "result": None}
+_network_lock = threading.Lock()
+
+
+def network_interfaces(fresh=False):
+    # Fixed native commands only; no shell and no external network requests.
+    with _network_lock:
+        if not fresh and _network_cache["result"] is not None and time.monotonic() - _network_cache["time"] < 5:
+            return copy.deepcopy(_network_cache["result"])
+        def output(args):
+            try:
+                result = subprocess.run(args, capture_output=True, text=True, timeout=3)
+                return result.stdout if result.returncode == 0 else ""
+            except (OSError, subprocess.TimeoutExpired):
+                return ""
+        config = output(["/sbin/ifconfig"])
+        hardware = output(["/usr/sbin/networksetup", "-listallhardwareports"])
+        route = output(["/sbin/route", "-n", "get", "default"])
+        match = re.search(r"interface:\s*(\S+)", route)
+        result = {"interfaces": parse_network_interfaces(config, hardware, match[1] if match else ""),
+                  "error": "" if config else "无法读取本机网卡，请检查系统权限后重试"}
+        _network_cache.update(time=time.monotonic(), result=result)
+        return copy.deepcopy(result)
+
+
+def resolve_lan_profile(profile, network=None):
+    result = copy.deepcopy(profile)
+    if profile.get("access_scope", "local") != "lan":
+        return result
+    network = network if network is not None else network_interfaces(fresh=True)
+    addresses = [item["address"] for item in network["interfaces"]
+                 if item["interface"] == profile.get("network_interface")]
+    if not addresses:
+        raise UserError(network.get("error") or "所选网卡没有可用 IPv4 地址，请连接网络或重新选择网卡")
+    result["bind_host"] = profile["bind_host"] if profile.get("bind_host") in addresses else addresses[0]
+    return result
 
 
 def port(value, label, allow_empty=False):
@@ -117,9 +179,20 @@ def validate_profile(data, original=None):
     result["target"] = safe_target(result.get("target"), "SSH 主机")
     result["jump"] = safe_target(result.get("jump"), "跳板机", optional=True)
     result["ssh_port"] = port(result.get("ssh_port"), "SSH 端口", allow_empty=True)
+    result["access_scope"] = result.get("access_scope", "local")
+    if result["access_scope"] not in {"local", "lan"}:
+        raise UserError("访问范围不正确")
     result["bind_host"] = result.get("bind_host", "127.0.0.1")
-    if result["bind_host"] not in {"127.0.0.1", "::1"}:
-        raise UserError("为保护本机和服务器，监听地址仅允许 127.0.0.1 或 ::1")
+    if result["access_scope"] == "lan":
+        if result["kind"] != "L":
+            raise UserError("只有本地转发可以开启局域网共享")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,31}", str(result.get("network_interface", ""))):
+            raise UserError("请选择本机网络接口")
+        result = resolve_lan_profile(result)
+    else:
+        result["network_interface"] = ""
+        if result["bind_host"] not in {"127.0.0.1", "::1"}:
+            raise UserError("仅本机模式的监听地址只允许 127.0.0.1 或 ::1")
     result["bind_port"] = port(result.get("bind_port"), "监听端口")
     if result["bind_port"] < 1024:
         raise UserError("请使用 1024 以上的监听端口，无需管理员权限")
@@ -230,7 +303,20 @@ def parse_ssh(argv):
                 "health_url": "https://www.baidu.com", "identity_file": options.get("i", ""),
                 "config_file": options.get("F", ""),
             }
-            result.append(validate_profile(data))
+            if kind == "L" and bind_host not in {"127.0.0.1", "::1"}:
+                # Discovery must still recognize a live listener after its NIC
+                # address disappears. Validation of new saves/starts is stricter.
+                ip = ipaddress.IPv4Address(bind_host)
+                if ip.is_unspecified or ip.is_multicast or ip.is_loopback or ip.is_link_local:
+                    continue
+                data["bind_host"] = "127.0.0.1"
+                observed = validate_profile(data)
+                interface = next((item["interface"] for item in network_interfaces()["interfaces"]
+                                  if item["address"] == bind_host), "unavailable")
+                observed.update(bind_host=bind_host, access_scope="lan", network_interface=interface)
+                result.append(observed)
+            else:
+                result.append(validate_profile(data))
         except (ValueError, UserError):
             continue
     return result
@@ -242,6 +328,9 @@ def signature(p):
 
 
 def connection_settings(p):
+    p = dict(p)
+    if p.get("access_scope") == "lan":
+        p["bind_host"] = "interface:" + p.get("network_interface", "")
     return tuple((key, p.get(key)) for key in (
         "kind", "target", "ssh_port", "jump", "bind_host", "bind_port", "dest_host",
         "dest_port", "identity_file", "config_file", "auth_mode"))
@@ -257,7 +346,11 @@ def http_probe_args(profile, endpoint, executable="curl"):
         args += ["--proxy", scheme + "://" + endpoint]
     else:
         args += ["--proxy", ""]
-    return args + ["-w", "\n__TD_STATUS__:%{http_code}\n", profile["health_url"]]
+    url = profile["health_url"]
+    if profile.get("access_scope") == "lan" and profile["health_type"] == "http":
+        parsed = urlsplit(url)
+        url = f"{parsed.scheme}://{endpoint}{parsed.path or '/'}" + ("?" + parsed.query if parsed.query else "")
+    return args + ["-w", "\n__TD_STATUS__:%{http_code}\n", url]
 
 
 def scan_processes():
@@ -497,6 +590,9 @@ class Manager:
                 if rt.get("identity") != identity:
                     rt.pop("health", None)
                     rt["connected_at"] = stamp()
+                previous = rt.get("observed_profile", profile)
+                if previous.get("access_scope") == "lan":
+                    candidate = {**candidate, "access_scope": "lan", "network_interface": previous["network_interface"]}
                 rt.update(pid=found["pid"], identity=identity, observed_profile=copy.deepcopy(candidate))
                 rt.setdefault("desired_running", True)
             self._save()
@@ -519,8 +615,11 @@ class Manager:
                 matched = next((item for item in processes if signature(item["profile"]) == signature(p)
                                 or signature(item["profile"]) == signature(old)), None)
                 if matched:
+                    observed = copy.deepcopy(matched["profile"])
+                    if old.get("access_scope") == "lan":
+                        observed.update(access_scope="lan", network_interface=old["network_interface"])
                     rt.update(pid=matched["pid"], identity=process_identity(matched["pid"]),
-                              observed_profile=copy.deepcopy(matched["profile"]), connected_at=stamp())
+                              observed_profile=observed, connected_at=stamp())
                     rt.pop("health", None)
             for pid, child in list(self.children.items()):
                 if child.poll() is not None:
@@ -544,6 +643,7 @@ class Manager:
 
     def snapshot(self):
         self._refresh()
+        network = network_interfaces() if any(p.get("access_scope") == "lan" for p in self.profiles) else None
         with self.lock:
             cards = []
             for profile in self.profiles:
@@ -571,6 +671,18 @@ class Manager:
                             command=shlex.join(self.build_ssh(profile)),
                             busy=any(j["tunnel_id"] == profile["id"] and j["status"] == "running" for j in self.jobs.values()),
                             retry_at=rt.get("retry_at"))
+                card["share_url"] = None
+                card["network_warning"] = ""
+                if active.get("access_scope") == "lan":
+                    try:
+                        resolved = resolve_lan_profile(active, network)
+                        if current and resolved["bind_host"] != active["bind_host"]:
+                            card["network_warning"] = "网卡 IP 已变化，请重启隧道以更新共享地址"
+                    except UserError as exc:
+                        card["network_warning"] = str(exc)
+                    if current:
+                        scheme = urlsplit(profile.get("health_url", "")).scheme if profile.get("health_type") == "http" else "http"
+                        card["share_url"] = f"{scheme}://{active['bind_host']}:{active['bind_port']}/"
                 cards.append(card)
             # Don't return credentials, launchd plist contents, or environment variables.
             return {"tunnels": cards, "aliases": self.aliases, "scan_error": self.scan_error,
@@ -584,7 +696,13 @@ class Manager:
         for other in self.profiles:
             if other["id"] == profile["id"]:
                 continue
-            if profile["bind_host"] != other["bind_host"] or profile["bind_port"] != other["bind_port"]:
+            active = self._rt(other["id"]).get("observed_profile", other) if self._current_process(other) else other
+            try:
+                future = resolve_lan_profile(other, network_interfaces()) if other.get("access_scope") == "lan" else other
+            except UserError:
+                future = other
+            if not any(profile["bind_host"] == item["bind_host"] and profile["bind_port"] == item["bind_port"]
+                       for item in (active, future)):
                 continue
             same_side = (profile["kind"] == "R") == (other["kind"] == "R")
             if not same_side:
@@ -762,6 +880,11 @@ class Manager:
             rt.update(desired_running=True, last_error="")
             if self._current_process(profile):
                 return "通道已经在运行"
+            profile = resolve_lan_profile(profile)
+            if automatic and profile.get("access_scope") == "lan":
+                previous = rt.get("observed_profile", profile)
+                if previous.get("bind_host") != profile["bind_host"]:
+                    raise UserError("网卡 IP 已变化，请手动重启隧道以更新共享地址")
             self._check_conflict(profile)
         if profile.get("source") == "launchd":
             path, _ = self._trusted_launch_agent(profile)
@@ -870,6 +993,8 @@ class Manager:
         with self.lock:
             if connection_settings(profile) != connection_settings(self._rt(profile_id).get("observed_profile", profile)):
                 raise UserError("连接配置已修改，请先重启通道，再按新配置检测")
+        if profile.get("access_scope") == "lan":
+            profile["bind_host"] = self._rt(profile_id).get("observed_profile", profile)["bind_host"]
         if profile["kind"] == "R":
             endpoint = f"{self._address(profile['bind_host'])}:{profile['bind_port']}"
             if profile["health_type"] == "tcp":
@@ -925,6 +1050,8 @@ class Manager:
         method = "TCP" if profile["health_type"] == "tcp" else "GET"
         details = ("检测方式：TCP\n\n" if method == "TCP" else
                    f"检测方式：GET\n检测地址：{profile['health_url']}\n\n") + output
+        if profile.get("access_scope") == "lan":
+            details += f"\n\n实际检测入口：{endpoint}。此检测从本机发起，不能验证同事电脑的网络或防火墙可达性。"
         if is_api and responded:
             details += "\n\n已收到接口响应；此检测不携带接口密钥，也不发起模型调用。"
         check_result = {"ok": success, "level": level, "message": message, "time": stamp(),
@@ -1101,6 +1228,8 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return self._send(401, {"error": "请通过本机启动器打开管理页面"})
             try:
+                if path == "/api/network-interfaces":
+                    return self._send(200, network_interfaces(fresh=True))
                 if path == "/api/state":
                     return self._send(200, self.server.manager.snapshot())
                 if path == "/api/ping":

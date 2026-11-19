@@ -15,3 +15,5 @@ svg{fill:none;stroke:currentColor;stroke-width:1.65;stroke-linecap:round;stroke-
 .health-summary{border:0;background:none;padding:0;text-align:left}.health-summary.warn{color:#99752c}.health-summary span:last-child{white-space:normal;line-height:1.6;overflow-wrap:anywhere}
 @media(max-width:720px){.nav-label{display:none}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
+
+.share-entry{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 20px;border-top:1px solid var(--line);font-size:13px}.share-entry a{color:var(--green);overflow-wrap:anywhere}.share-entry span{color:var(--muted)}

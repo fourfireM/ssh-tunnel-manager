@@ -325,6 +325,13 @@ class SecurityHTTPTests(unittest.TestCase):
     def test_api_requires_authorization(self):
         self.assertEqual(self.request("GET", "/api/state")[0], 401)
 
+    def test_network_interfaces_require_local_authorization(self):
+        self.assertEqual(self.request("GET", "/api/network-interfaces")[0], 401)
+        with patch.object(app, "network_interfaces", return_value={"interfaces": [], "error": ""}):
+            status, _, body = self.request("GET", "/api/network-interfaces", Authorization="Bearer " + self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"interfaces": [], "error": ""})
+
     def test_authorized_same_origin_works(self):
         status, headers, body = self.request("GET", "/api/state", Authorization="Bearer " + self.token)
         self.assertEqual(status, 200)

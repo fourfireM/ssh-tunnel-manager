@@ -49,6 +49,7 @@ let filter = 'all', view = 'overview', query = '', editingId = null, inspectId =
 let confirmCallback = null, loading = false, firstLoad = true;
 const watchedJobs = new Set();
 let renderFingerprint = '';
+let networkOptions = [], networkRequest = 0;
 
 async function api(path, {method = 'GET', body} = {}) {
   const headers = {'Authorization': `Bearer ${token}`, 'X-Tunnel-Desk': '1'};
@@ -98,6 +99,8 @@ function card(t) {
     ${t.pending_changes ? '<div class="pending-label">配置已更新，重启后生效；当前连接仍使用原配置。</div>' : ''}
     <div class="card-top"><span class="tunnel-symbol ${t.dest_port === 8317 ? 'blue' : ''}">${icon(t.kind === 'D' ? 'globe' : 'arrows')}</span><div class="card-title-area"><div class="card-title-line"><h2>${esc(t.name)}</h2><span class="source-badge" title="${esc(sourceDescription(t))}">${esc(sourceLabel(t))}</span></div><p>${esc(t.description || `${t.kind === 'R' ? '反向转发' : t.kind === 'L' ? '本地转发' : '动态 SOCKS'} · ${t.target}`)}</p></div><div class="card-toggle-area"><span class="status-label ${esc(t.status)}"><span class="tiny-dot"></span>${label}</span><button class="switch" role="switch" aria-checked="${isRunning}" aria-label="${isRunning ? '关闭' : '开启'} ${esc(t.name)}" data-action="toggle" data-id="${t.id}" ${t.busy ? 'disabled' : ''}></button></div></div>
     <div class="route"><div class="route-endpoint"><span class="route-caption">${leftCaption}</span><div class="route-host">${icon(remoteEntry ? 'server' : 'monitor')}<span title="${esc(leftHost)}">${esc(leftHost)}</span></div><div class="route-address">${esc(route.bind_host)}:<strong>${route.bind_port}</strong></div></div><div class="route-arrow"><div class="route-line">${icon('arrow-right')}</div><span class="route-hop" title="${esc(route.jump || '直接 SSH 连接')}">${route.jump ? '经跳板机' : 'SSH'}</span></div><div class="route-endpoint"><span class="route-caption">${rightCaption}</span><div class="route-host">${icon(remoteEntry ? 'monitor' : 'server')}<span>${esc(rightHost)}</span></div><div class="route-address">${rightAddress}</div></div></div>
+    ${t.share_url ? `<div class="share-entry"><span>共享地址</span><a href="${esc(t.share_url)}" target="_blank" rel="noopener noreferrer">${esc(t.share_url)}</a><button class="text-button" data-action="copy-share" data-id="${t.id}">复制地址</button><a href="${esc(t.share_url)}" target="_blank" rel="noopener noreferrer">打开页面</a></div>` : ''}
+    ${t.network_warning ? `<div class="pending-label">${esc(t.network_warning)}</div>` : ''}
     <div class="card-state"><span class="state-item ${isRunning ? 'good' : ''}">${icon(isRunning ? 'link' : 'clock')}${isRunning ? 'SSH ' + (t.status === 'connecting' ? '正在认证' : '已连接') : 'SSH 未连接'}${t.pid ? `<span class="pid">PID ${t.pid}</span>` : ''}</span>${stateItem}</div>
     ${t.last_error && !isRunning ? `<div class="card-error">${esc(t.last_error)}</div>` : ''}
     <div class="card-footer"><button class="health-summary ${healthLevel}" data-action="health" data-id="${t.id}" title="${esc(healthText)}；点击查看检测详情">${icon(t.busy ? 'clock' : health ? healthLevel === 'good' ? 'shield' : 'alert' : 'info')}<span>${t.busy ? '操作处理中…' : esc(healthText)}</span></button><div class="card-actions"><button class="check-button" data-action="check" data-id="${t.id}" ${!isRunning || t.busy || t.pending_changes ? 'disabled' : ''}>${icon('activity')}检测链路</button><button class="icon-button" data-action="edit" data-id="${t.id}" aria-label="编辑 ${esc(t.name)}" title="编辑配置">${icon('edit')}</button><button class="icon-button" data-action="logs" data-id="${t.id}" aria-label="查看 ${esc(t.name)} 日志" title="查看日志">${icon('file')}</button><details class="card-menu"><summary aria-label="${esc(t.name)} 更多操作">${icon('more')}</summary><div class="card-menu-panel"><button data-action="restart" data-id="${t.id}" ${t.busy || !isRunning ? 'disabled' : ''}>${icon('refresh')}重启连接</button><button data-action="clone" data-id="${t.id}">${icon('copy')}复制配置</button><button class="delete" data-action="delete" data-id="${t.id}" ${t.source === 'launchd' ? 'disabled title="保留原系统任务；可以关闭通道"' : ''}>${icon('trash')}移除配置</button></div></details></div></div>
@@ -172,7 +175,7 @@ function showForm(tunnel = null, clone = false) {
   form.reset();
   editingId = tunnel && !clone ? tunnel.id : null;
   $('form-title').textContent = clone ? '复制通道' : tunnel ? '编辑通道' : '新建通道';
-  const defaults = {name:'',description:'',kind:'R',target:'',ssh_port:'',jump:'',bind_host:'127.0.0.1',bind_port:'',dest_host:'127.0.0.1',dest_port:'',auth_mode:'auto',auto_reconnect:false,health_type:'http_proxy',health_url:'https://www.baidu.com',identity_file:'',config_file:''};
+  const defaults = {access_scope:'local',network_interface:'',name:'',description:'',kind:'R',target:'',ssh_port:'',jump:'',bind_host:'127.0.0.1',bind_port:'',dest_host:'127.0.0.1',dest_port:'',auth_mode:'auto',auto_reconnect:false,health_type:'http_proxy',health_url:'https://www.baidu.com',identity_file:'',config_file:''};
   const data = {...defaults, ...(tunnel || {})};
   if (clone) { data.name += ' · 副本'; data.bind_port = ''; data.auto_reconnect = false; }
   for (const key of Object.keys(defaults)) {
@@ -190,10 +193,44 @@ function showForm(tunnel = null, clone = false) {
   $('form-error').hidden = true;
   updateForm();
   $('profile-dialog').showModal();
+  loadInterfaces(data.network_interface);
 }
+
+async function loadInterfaces(selected = null) {
+  const request = ++networkRequest;
+  const field = $('profile-form').elements.namedItem('network_interface');
+  selected = selected ?? field.value;
+  $('refresh-interfaces').disabled = true;
+  try {
+    const result = await api('/api/network-interfaces');
+    if (request !== networkRequest) return;
+    networkOptions = result.interfaces;
+    field.innerHTML = networkOptions.map(item => `<option value="${esc(item.interface)}">${esc(item.label)} · ${esc(item.interface)} · ${esc(item.address)}${item.recommended ? '（推荐）' : ''}${!item.physical ? '（虚拟接口）' : ''}</option>`).join('');
+    if (selected && !networkOptions.some(item => item.interface === selected)) {
+      field.insertAdjacentHTML('afterbegin', `<option value="${esc(selected)}">${esc(selected)} · 无可用 IPv4 地址</option>`);
+    }
+    if (!networkOptions.length && !selected) field.innerHTML = '<option value="">没有可用 IPv4 网卡</option>';
+    if (selected) field.value = selected;
+    if (result.error) toast(result.error, true);
+    updateForm();
+  } catch (error) {
+    if (request !== networkRequest) return;
+    field.innerHTML = '<option value="">网卡读取失败，请刷新</option>';
+    toast(error.message, true);
+  } finally { if (request === networkRequest) $('refresh-interfaces').disabled = false; }
+}
+$('refresh-interfaces').addEventListener('click', () => loadInterfaces());
 
 function updateForm() {
   const form = $('profile-form'), kind = form.elements.namedItem('kind').value;
+  const scope = form.elements.namedItem('access_scope');
+  if (kind !== 'L') scope.value = 'local';
+  const lan = kind === 'L' && scope.value === 'lan';
+  $('access-scope-field').hidden = kind !== 'L';
+  $('network-interface-field').hidden = !lan;
+  $('lan-notice').hidden = !lan;
+  $('bind-host-field').hidden = lan;
+  form.elements.namedItem('network_interface').required = lan;
   document.querySelectorAll('.destination-field').forEach(el => { el.hidden = kind === 'D'; });
   form.elements.namedItem('dest_port').required = kind !== 'D';
   $('bind-port-label').textContent = kind === 'R' ? '远端监听端口' : 'Mac 监听端口';
@@ -204,9 +241,13 @@ function updateForm() {
 $('profile-form').addEventListener('submit', async event => {
   event.preventDefault();
   const form = event.currentTarget, data = {};
-  for (const key of ['name','description','kind','target','ssh_port','jump','bind_host','bind_port','dest_host','dest_port','auth_mode','health_type','health_url','identity_file','config_file']) data[key] = form.elements.namedItem(key).value;
+  for (const key of ['access_scope','network_interface','name','description','kind','target','ssh_port','jump','bind_host','bind_port','dest_host','dest_port','auth_mode','health_type','health_url','identity_file','config_file']) data[key] = form.elements.namedItem(key).value;
   data.auto_reconnect = form.elements.namedItem('auto_reconnect').checked;
   $('save-button').disabled = true;
+  if (data.access_scope === 'lan') {
+    const selected = networkOptions.find(item => item.interface === data.network_interface);
+    data.bind_host = selected?.address || '127.0.0.1';
+  } else if (!['127.0.0.1', '::1'].includes(data.bind_host)) data.bind_host = '127.0.0.1';
   $('form-error').hidden = true;
   try {
     await api(editingId ? `/api/tunnels/${editingId}` : '/api/tunnels', {method:editingId ? 'PUT' : 'POST',body:data});
@@ -219,7 +260,15 @@ $('profile-form').addEventListener('submit', async event => {
     $('form-error').scrollIntoView({block:'nearest'});
   } finally { $('save-button').disabled = false; }
 });
-$('profile-form').addEventListener('change', updateForm);
+$('profile-form').addEventListener('change', event => {
+  const form = event.currentTarget;
+  if ((event.target.name === 'access_scope' && event.target.value === 'lan') ||
+      (event.target.name === 'kind' && event.target.value === 'L')) {
+    form.elements.namedItem('health_type').value = 'http';
+    form.elements.namedItem('health_url').value = `http://127.0.0.1:${form.elements.namedItem('bind_port').value || '18765'}/`;
+  }
+  updateForm();
+});
 
 function confirmAction(title, description, label, callback) {
   $('confirm-title').textContent = title;
@@ -286,6 +335,11 @@ document.addEventListener('click', async event => {
   const t = state.tunnels.find(t => t.id === id);
   if (!t) return;
   button.closest('details')?.removeAttribute('open');
+  if (action === 'copy-share') {
+    try { await navigator.clipboard.writeText(t.share_url); toast('共享地址已复制'); }
+    catch { toast('无法访问剪贴板，请手动复制共享地址。', true); }
+    return;
+  }
   if (action === 'edit') return showForm(t);
   if (action === 'clone') return showForm(t, true);
   if (action === 'logs') return showInspector(id);
